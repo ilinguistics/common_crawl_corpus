@@ -8,3 +8,4 @@ cytoolz
 nltk
 emoji
 alphabet-detector
+fastwarc
