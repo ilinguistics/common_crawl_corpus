@@ -72,7 +72,7 @@ COUNTRY_CODES_NAME: Dict[str, str] = {
     "台灣": "Taiwan", "新加坡": "Singapore", "澳門": "Macao", "香港": "Hong_Kong", "한국": "South_Korea"
 }
 
-COUNTRY_CODES_REGION: typing.Dict[str, str] = {
+COUNTRY_CODES_REGION: Dict[str, str] = {
     "ad": "europe_west", "ae": "middle_east", "af": "asia_central", "al": "europe_west", "ao": "africa_sub",
     "aq": "antarctica", "ar": "america_south", "as": "asia_southeast",
     "at": "europe_west", "au": "oceania", "aw": "america_central", "ax": "europe_west", "az": "asia_central",
@@ -224,8 +224,8 @@ def remove_emoji(text: str):
 
 
 def extract_url(url: str):
-    _, domain, suffix = tldextract.extract(url)
-    return domain, suffix.split('.')[-1]
+    result = tldextract.extract(url)
+    return result.domain, result.suffix.split('.')[-1]
 
 
 def extract_n_grams(text: str, n: int = 1):

@@ -308,7 +308,8 @@ class CC_Corpus(object):
             if temp := self._process_wet_record(record):
                 lines.extend(temp)
         # add prefix dataframe to filename, change extension to .feather stead of gzip
-        path_split = index.split(os.sep)
+        # path_split = index.split(os.path.sep)
+        path_split = index.split("/")
         cc_index = path_split[1]  # CC-MAIN-2022-40
         name, _ = os.path.splitext(path_split[-1])  # e.g. CC-MAIN-2....wet
 
