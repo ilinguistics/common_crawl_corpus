@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 from functools import partial
 from multiprocessing.pool import ThreadPool
+import time
 from typing import List, Optional, Tuple, Union
 
 import pandas as pd
@@ -13,7 +14,7 @@ import requests
 from alphabet_detector import AlphabetDetector
 from cytoolz import pipe, juxt
 from gensim.parsing import preprocessing
-from warcio.archiveiterator import ArchiveIterator
+from fastwarc.warc import ArchiveIterator, WarcRecordType
 
 from . import utilities
 
@@ -237,9 +238,9 @@ class CC_Corpus(object):
     def _process_wet_record(self, wet_record) -> Optional[List[Tuple[str, str, str, int, str, int]]]:
         """Read individual wet record, split the content to different paragraph, apply filter to remove unwanted
         character and short/trivial lines """
-        if wet_record.rec_type != "conversion":
+        if wet_record.record_type != WarcRecordType.conversion:
             return
-        url = wet_record.rec_headers.get_header("WARC-Target-URI")
+        url = wet_record.headers.get("WARC-Target-URI")
         # getting domain abc.example.com -> ExtractResult(subdomain='abc', domain='hostname', suffix='com')
         url_domain, url_suffix = utilities.extract_url(url)
 
@@ -247,7 +248,7 @@ class CC_Corpus(object):
             return
         current_country = COUNTRY_CODE_NAME.get(url_suffix)
 
-        web_content: str = wet_record.content_stream().read().decode("utf-8")
+        web_content: str = wet_record.reader.read().decode("utf-8")
         processed_line: List[Tuple[str, str, str, int, str, int]] = []
         line_num = 0  # flag to make sure it is the same page
 
