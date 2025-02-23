@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from alphabet_detector import AlphabetDetector
 from cytoolz import pipe, juxt
+from pandas.errors import SettingWithCopyWarning
 from gensim.parsing import preprocessing
 from fastwarc.warc import ArchiveIterator, WarcRecordType
 from rbloom import Bloom
@@ -342,6 +343,7 @@ class CC_Corpus(object):
         """This method conducts deduplication on a directory of crawl files"""
         self.logger.info(f'_deduplicate_cc: De-duplicating {os.path.basename(path_to_input)}')
         warnings.simplefilter(action="ignore", category=FutureWarning)
+        warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
 
         df = pd.read_feather(path_to_input)
         if path_to_output is None:
@@ -349,9 +351,9 @@ class CC_Corpus(object):
         original_len = len(df.index)
 
         victims = []
-        ad = AlphabetDetector()
+        ad = AlphabetDetector() # TODO: Replace with actual alphabet detector used above
 
-        for index, document in df.iterrows():
+        for index, document in df.iterrows(): # TODO: replace df with map
             doc_text = document["Text"]
             scripts = ad.detect_alphabet(doc_text)
             if doc_text in bf:
