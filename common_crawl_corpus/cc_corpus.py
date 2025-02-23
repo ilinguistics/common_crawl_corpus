@@ -9,12 +9,15 @@ from multiprocessing.pool import ThreadPool
 import time
 from typing import List, Optional, Tuple, Union
 
+import warnings
+
 import pandas as pd
 import requests
 from alphabet_detector import AlphabetDetector
 from cytoolz import pipe, juxt
 from gensim.parsing import preprocessing
 from fastwarc.warc import ArchiveIterator, WarcRecordType
+from rbloom import Bloom
 
 from . import utilities
 
@@ -284,14 +287,13 @@ class CC_Corpus(object):
                 length = 50
             if len(line) < length:
                 continue
-            text_hash = hash(line)
             string_counter = collections.Counter(line)
             if all([string_counter.get("-", 0) < 4, string_counter.get("(", 0) < 4, string_counter.get(")", 0) < 4,
                     string_counter.get("=", 0) < 2, string_counter.get("_", 0) < 2, string_counter.get(".", 0) < 15,
                     string_counter.get("&", 0) < 4, string_counter.get("[", 0) < 3, string_counter.get("]", 0) < 3,
                     string_counter.get("*", 0) < 5]):
                 line_num += 1
-                processed_line.append((url_suffix, current_country, url, line_num, line, text_hash))
+                processed_line.append((url_suffix, current_country, url, line_num, line))
         return processed_line
 
     def download_and_process_wet_segment(self, index: str):
@@ -309,12 +311,11 @@ class CC_Corpus(object):
             if temp := self._process_wet_record(record):
                 lines.extend(temp)
         # add prefix dataframe to filename, change extension to .feather stead of gzip
-        # path_split = index.split(os.path.sep)
         path_split = index.split("/")
         cc_index = path_split[1]  # CC-MAIN-2022-40
         name, _ = os.path.splitext(path_split[-1])  # e.g. CC-MAIN-2....wet
 
-        df = pd.DataFrame(lines, columns=("Domain", "Country", "URL", "LineID", "Text", "Hash"))
+        df = pd.DataFrame(lines, columns=("Domain", "Country", "URL", "LineID", "Text"))
         df.reset_index()
         df.to_feather(os.path.join(self.download_dir, cc_index, f'{name}.feather'))
 
@@ -337,22 +338,48 @@ class CC_Corpus(object):
 
     # ----------------------------------------------------------------------------------------------------------------------#
 
-    def _deduplicate_cc(self, path_to_input: str, path_to_output=None):
+    def _deduplicate_cc(self, bf: Bloom, metadata_df: pd.DataFrame, path_to_input: str, path_to_output=None):
         """This method conducts deduplication on a directory of crawl files"""
         self.logger.info(f'_deduplicate_cc: De-duplicating {os.path.basename(path_to_input)}')
+        warnings.simplefilter(action="ignore", category=FutureWarning)
+
         df = pd.read_feather(path_to_input)
         if path_to_output is None:
             path_to_output = path_to_input
         original_len = len(df.index)
-        df.drop_duplicates(subset="Hash", inplace=True, ignore_index=True)
+
+        victims = []
+        ad = AlphabetDetector()
+
+        for index, document in df.iterrows():
+            doc_text = document["Text"]
+            scripts = ad.detect_alphabet(doc_text)
+            if doc_text in bf:
+                victims.append(index)
+                for script in scripts:
+                    if (metadata_df['Script'] == script).any():
+                        metadata_df.loc[metadata_df['Script'] == script]['Deleted'] += 1 # TODO: CHANGE THIS OR ELSE
+                    else:
+                        metadata_df.loc[metadata_df.shape[0]] = [script, 0, 1]
+            else:
+                bf.add(doc_text)
+                for script in scripts:
+                    if (metadata_df['Script'] == script).any():
+                        metadata_df.loc[metadata_df['Script'] == script]['Kept'] += 1
+                    else:
+                        metadata_df.loc[df.shape[0]] = [script, 1, 0]
+
+        df.drop(index=victims)
+
         self.logger.debug(
-            f"_deduplicate_cc: {original_len} formatted and removed {original_len - len(df.index)}, remaining: {len(df.index)}")
+            f"_deduplicate_cc: {original_len} formatted and removed {len(victims)}, remaining: {len(df.index)}")
+        
         df.to_feather(path_to_output)
         self.logger.debug(f'_deduplicate_cc: saved as {path_to_output}')
 
         # ------------------------------------------------------------------------------------------------------------#
 
-    def automatically_process_crawl(self, prefix_list, chunk_size=2):
+    def automatically_process_crawl(self, prefix_list, chunk_size=2, max_chunks=-1, dedup_size=1):
         """Automatically download, process, and deduplicate on 1 prefix
         e.g. CC-MAIN-2022-40
         """
@@ -361,6 +388,9 @@ class CC_Corpus(object):
         with gzip.open(prefix_filedir) as index_file:
             lines = [line.decode("utf-8").rstrip() for line in index_file.readlines()]
         chunks = utilities.divide_list(lines, chunk_size)
+        bf = Bloom(1000000 * dedup_size, 0.0001)
+        metadata_df = pd.DataFrame(columns=["Script", "Kept", "Deleted"])
+
         # process each chunk
         for i, chunk in enumerate(chunks, start=1):
             self.logger.info(f'Processing chunk {i} of {len(chunks)}')
@@ -377,10 +407,21 @@ class CC_Corpus(object):
             # Save to file using the latest name, add prefix combined
             filename = os.path.join(self.download_dir, prefix_list, f"combined-{os.path.basename(max(df_files))}")
             pd.concat(df_list, ignore_index=True).to_feather(filename)
+            
             # Dedupe, add prefix deduplicated
             new_filename = os.path.join(self.download_dir, prefix_list, f"deduplicated-{os.path.basename(filename)}")
-            self._deduplicate_cc(filename, new_filename)
+            
+
+            self._deduplicate_cc(bf, metadata_df, filename, new_filename)
             os.remove(filename)
+            if i % dedup_size == 0:
+                bf.clear()
+            if i == max_chunks:
+                break
+
+        metadata_path = os.path.join(self.download_dir, prefix_list, "metadata.csv")
+        metadata_df.to_csv(metadata_path)
+        self.logger.debug(f'automatically_process_crawl: saved metadata to {metadata_path}')
 
         # ----------------------------------------------------------------------------------------------------------------------#
 
