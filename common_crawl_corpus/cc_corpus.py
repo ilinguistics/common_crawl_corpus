@@ -6,7 +6,6 @@ import multiprocessing as mp
 import os
 from functools import partial
 from multiprocessing.pool import ThreadPool
-import time
 from typing import List, Optional, Tuple, Union, Dict
 from collections import Counter
 
@@ -14,12 +13,12 @@ import warnings
 
 import pandas as pd
 import requests
-from alphabet_detector import AlphabetDetector
 from cytoolz import pipe, juxt
 from pandas.errors import SettingWithCopyWarning
 from gensim.parsing import preprocessing
 from fastwarc.warc import ArchiveIterator, WarcRecordType
 from rbloom import Bloom
+from GlotScript import sp
 
 from . import utilities
 
@@ -221,9 +220,6 @@ class CC_Corpus(object):
         # Download directory
         self.download_dir = download_dir
 
-        # Detecting language based on alphabet
-        self.alphabet_detector = AlphabetDetector()
-
         # This list defines what countries to include in the corpus
         self.country_codes = []
 
@@ -279,10 +275,10 @@ class CC_Corpus(object):
             if len(character_only) <= 12:
                 continue
 
-            scripts = self.alphabet_detector.detect_alphabet(line)
+            scripts = list(sp(line)[2]["details"].keys())
 
             # Check if line has Chinese / Japanese / Korean characters, then set length to 15:
-            if any(script in ["CJK", "KATAKANA-HIRAGANA", "KATAKANA", "HIRAGANA", "HANGUL"] for script in scripts):
+            if any(script in ["Hani", "Hans", "Hant", "Hrkt", "Kana", "Hira", "Jpan", "Hang", "Jamo", "Kore"] for script in scripts):
                 length = 15
             else:
                 length = 50
