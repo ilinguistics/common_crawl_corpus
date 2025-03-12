@@ -248,6 +248,7 @@ class CC_Corpus(object):
         if url_suffix not in COUNTRY_CODE_NAME.keys() or url_domain in self.url_filter:
             return
         current_country = COUNTRY_CODE_NAME.get(url_suffix)
+        current_region = COUNTRY_CODE_REGION.get(url_suffix)
 
         web_content: str = wet_record.reader.read().decode("utf-8")
         processed_line: List[Tuple[str, str, str, int, str, int]] = []
@@ -274,8 +275,9 @@ class CC_Corpus(object):
             character_only = pipe(line, preprocessing.strip_numeric, preprocessing.strip_punctuation)
             if len(character_only) <= 12:
                 continue
-
-            scripts = list(sp(line)[2]["details"].keys())
+            
+            script_details = sp(line)[2]["details"]
+            scripts = list(script_details.keys()) if script_details else ["SCRIPT DETECTION ERROR"]
 
             # Check if line has Chinese / Japanese / Korean characters, then set length to 15:
             if any(script in ["Hani", "Hans", "Hant", "Hrkt", "Kana", "Hira", "Jpan", "Hang", "Jamo", "Kore"] for script in scripts):
@@ -290,7 +292,7 @@ class CC_Corpus(object):
                     string_counter.get("&", 0) < 4, string_counter.get("[", 0) < 3, string_counter.get("]", 0) < 3,
                     string_counter.get("*", 0) < 5]):
                 line_num += 1
-                processed_line.append((url_suffix, current_country, url, line_num, line, scripts))
+                processed_line.append((url_suffix, current_country, current_region, url, line_num, line, scripts))
         return processed_line
 
     def download_and_process_wet_segment(self, index: str):
@@ -312,7 +314,7 @@ class CC_Corpus(object):
         cc_index = path_split[1]  # CC-MAIN-2022-40
         name, _ = os.path.splitext(path_split[-1])  # e.g. CC-MAIN-2....wet
 
-        df = pd.DataFrame(lines, columns=("Domain", "Country", "URL", "LineID", "Text", "Scripts"))
+        df = pd.DataFrame(lines, columns=("Domain", "Country", "Region", "URL", "LineID", "Text", "Scripts"))
         df.reset_index()
         df.to_feather(os.path.join(self.download_dir, cc_index, f'{name}.feather'))
 
@@ -384,7 +386,6 @@ class CC_Corpus(object):
             lines = [line.decode("utf-8").rstrip() for line in index_file.readlines()]
         chunks = utilities.divide_list(lines, chunk_size)
         bf = Bloom(1000000 * dedup_size, 0.0001)
-        # metadata_df = pd.DataFrame(columns=["Script", "Kept", "Deleted"])
         metadata = {}
 
         # process each chunk
