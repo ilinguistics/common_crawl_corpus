@@ -19,6 +19,7 @@ from gensim.parsing import preprocessing
 from fastwarc.warc import ArchiveIterator, WarcRecordType
 from rbloom import Bloom
 from GlotScript import sp
+from geoLid import geoLid, download_model
 
 from . import utilities
 
@@ -235,6 +236,11 @@ class CC_Corpus(object):
 
     # setup input and output dirs for methods
 
+    # ------------------------------------------------------------------------------------------------------------#
+
+    def _download_geolid_models():
+        pass # TODO
+
     # ----------------------------------------------------------------------------------------------#
     def _process_wet_record(self, wet_record) -> Optional[List[Tuple[str, str, str, int, str, List[str]]]]:
         """Read individual wet record, split the content to different paragraph, apply filter to remove unwanted
@@ -253,6 +259,9 @@ class CC_Corpus(object):
         web_content: str = wet_record.reader.read().decode("utf-8")
         processed_line: List[Tuple[str, str, str, int, str, int]] = []
         line_num = 0  # flag to make sure it is the same page
+
+        self._download_geolid_models()
+        lid = geoLid(model_location = self.download_dir)
 
         for line in web_content.splitlines():
             # we need the line larger than 15 character
@@ -277,7 +286,14 @@ class CC_Corpus(object):
                 continue
             
             script_details = sp(line)[2]["details"]
-            scripts = list(script_details.keys()) if script_details else ["SCRIPT DETECTION ERROR"]
+
+            if not script_details:
+                continue
+
+            scripts = list(script_details.keys())
+
+            lang_base = lid.predict(data = [line], region = "baseline")[0]
+            lang_region = lid.predict(data = [line], region = current_region)[0]
 
             # Check if line has Chinese / Japanese / Korean characters, then set length to 15:
             if any(script in ["Hani", "Hans", "Hant", "Hrkt", "Kana", "Hira", "Jpan", "Hang", "Jamo", "Kore"] for script in scripts):
@@ -292,7 +308,8 @@ class CC_Corpus(object):
                     string_counter.get("&", 0) < 4, string_counter.get("[", 0) < 3, string_counter.get("]", 0) < 3,
                     string_counter.get("*", 0) < 5]):
                 line_num += 1
-                processed_line.append((url_suffix, current_country, current_region, url, line_num, line, scripts))
+                processed_line.append((url_suffix, current_country, current_region, url, line_num, line, scripts, lang_base, lang_region))
+
         return processed_line
 
     def download_and_process_wet_segment(self, index: str):
@@ -314,7 +331,7 @@ class CC_Corpus(object):
         cc_index = path_split[1]  # CC-MAIN-2022-40
         name, _ = os.path.splitext(path_split[-1])  # e.g. CC-MAIN-2....wet
 
-        df = pd.DataFrame(lines, columns=("Domain", "Country", "Region", "URL", "LineID", "Text", "Scripts"))
+        df = pd.DataFrame(lines, columns=("Domain", "Country", "Region", "URL", "LineID", "Text", "Scripts", "Lang_Base", "Lang_Region"))
         df.reset_index()
         df.to_feather(os.path.join(self.download_dir, cc_index, f'{name}.feather'))
 

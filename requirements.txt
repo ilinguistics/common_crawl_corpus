@@ -9,3 +9,5 @@ nltk
 emoji
 alphabet-detector
 fastwarc
+geoLid
+fasttext
