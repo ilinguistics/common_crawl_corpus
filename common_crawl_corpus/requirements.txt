@@ -9,3 +9,4 @@ tldextract
 pyarrow
 nltk
 emoji
+matplotlib

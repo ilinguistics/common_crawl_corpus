@@ -4,6 +4,7 @@ import gzip
 import logging
 import multiprocessing as mp
 import os
+from shutil import rmtree
 from functools import partial
 from multiprocessing.pool import ThreadPool
 from typing import List, Optional, Tuple, Union, Dict
@@ -379,42 +380,46 @@ class CC_Corpus(object):
 
     # ----------------------------------------------------------------------------------------------------------------------#
 
-    def _deduplicate_cc(self, bf: Bloom, metadata: Dict[str, Counter], path_to_input: str, path_to_output: Optional[str] = None):
-        """This method conducts deduplication on a directory of crawl files"""
-        self.logger.info(f'_deduplicate_cc: De-duplicating {os.path.basename(path_to_input)}')
+    def _deduplicate_cc(self, bf: Bloom, metadata: Dict[str, Dict[str, Counter]], path_to_input: str, path_to_output: Optional[str] = None):
+        """This method conducts deduplication on a feathered DataFrame and saves the result to a new file."""
         warnings.simplefilter(action="ignore", category=FutureWarning)
         warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
 
         df = pd.read_feather(path_to_input)
         if path_to_output is None:
             path_to_output = path_to_input
-        original_len = len(df.index)
 
         victims = []
+        if "script" not in metadata:
+            metadata["script"] = {}
+        if "lang_region" not in metadata:
+            metadata["lang_region"] = {}
 
         for index, document in df.iterrows():
             doc_text = document["Text"]
             scripts = document["Scripts"]
+            lang_region = document["Lang_Region"]
             if doc_text in bf:
                 victims.append(index)
                 for script in scripts:
-                    if script not in metadata:
-                        metadata[script] = Counter()
-                    metadata[script]["Deleted"] += 1
+                    if script not in metadata["script"]:
+                        metadata["script"][script] = Counter()
+                    metadata["script"][script]["Deleted"] += 1
+                if lang_region not in metadata["lang_region"]:
+                    metadata["lang_region"][lang_region] = Counter()
+                metadata["lang_region"][lang_region]["Deleted"] += 1
             else:
                 bf.add(doc_text)
                 for script in scripts:
-                    if script not in metadata:
-                        metadata[script] = Counter()
-                    metadata[script]["Kept"] += 1
+                    if script not in metadata["script"]:
+                        metadata["script"][script] = Counter()
+                    metadata["script"][script]["Kept"] += 1
+                if lang_region not in metadata["lang_region"]:
+                    metadata["lang_region"][lang_region] = Counter()
+                metadata["lang_region"][lang_region]["Kept"] += 1
 
-        df.drop(index=victims)
-
-        self.logger.debug(
-            f"_deduplicate_cc: {original_len} formatted and removed {len(victims)}, remaining: {len(df.index)}")
-        
+        df.drop(index=victims)        
         df.to_feather(path_to_output)
-        self.logger.debug(f'_deduplicate_cc: saved as {path_to_output}')
 
         # ------------------------------------------------------------------------------------------------------------#
 
@@ -427,7 +432,7 @@ class CC_Corpus(object):
         with gzip.open(prefix_filedir) as index_file:
             lines = [line.decode("utf-8").rstrip() for line in index_file.readlines()]
         chunks = utilities.divide_list(lines, chunk_size)
-        bf = Bloom(1000000 * dedup_size, 0.0001)
+        bf_map = {}
         metadata = {}
 
         # process each chunk
@@ -450,29 +455,68 @@ class CC_Corpus(object):
             geolid_df = self._label_geolid(combined_df)
             del combined_df
             
-            # Save to file using the latest name, add prefix combined
-            filename = os.path.join(self.download_dir, prefix_list, f"combined-{os.path.basename(max(df_files))}")
-            geolid_df.to_feather(filename)
-            
-            # Dedupe, add prefix deduplicated
-            new_filename = os.path.join(self.download_dir, prefix_list, f"deduplicated-{os.path.basename(filename)}")
-            
+            holder_dir = os.path.join(self.download_dir, "temp_lang_dir")
+            if not os.path.exists(holder_dir):
+                os.makedirs(holder_dir)
 
-            self._deduplicate_cc(bf, metadata, filename, new_filename)
-            os.remove(filename)
+            # Split by lang
+            for lang in geolid_df["Lang_Region"].unique():
+                lang_df = geolid_df[geolid_df["Lang_Region"] == lang]
+                lang_df.to_feather(os.path.join(holder_dir, f"in.{lang}.feather"))
+
+            del geolid_df
+
+            # Deduplicate each language
+            lang_files = [f for f in os.listdir(holder_dir) if f.startswith("in.")]
+            for lang_file in lang_files:
+                lang_file_path = os.path.join(holder_dir, lang_file)
+                new_filename = os.path.join(holder_dir, f"deduplicated-{lang_file}.feather")
+                lang = lang_file.split(".")[1]
+                if lang not in bf_map:
+                    bf_map[lang] = Bloom(100000 * dedup_size, 0.0001)
+                bf = bf_map[lang]
+                self._deduplicate_cc(bf, metadata, lang_file_path, new_filename)
+                os.remove(lang_file_path)
+
+            # Combine all deduplicated files
+            full_df = pd.DataFrame()
+            dedup_files = glob.glob(os.path.join(holder_dir, "deduplicated-*.feather"))
+            df_list = []
+            for dedup_file in dedup_files:
+                dedup_file_path = os.path.join(holder_dir, dedup_file)
+                df = pd.read_feather(dedup_file_path)
+                df_list.append(df)
+            full_df = pd.concat(df_list, ignore_index=True)
+            del df_list
+
+            # Remove everything in holder_dir
+            rmtree(holder_dir)
+
+            # Save the full deduplicated file
+            new_filename =  os.path.join(self.download_dir, prefix_list, f"deduplicated-combined-{os.path.basename(max(df_files))}")
+            full_df.to_feather(new_filename)
+            self.logger.debug(f'automatically_process_crawl: saved deduplicated file as {new_filename}')
+
+            # Once the number of chunks reaches the dedup_size, clear the bloom filter to reset deduplication
             if i % dedup_size == 0:
-                bf.clear()
+                bf_map.clear()
             if i == max_chunks:
                 break
 
-        metadata_path = os.path.join(self.download_dir, prefix_list, "metadata.csv")
+        script_metadata_path = os.path.join(self.download_dir, prefix_list, "script_metadata.csv")
         
-        mdf = pd.DataFrame.from_dict(metadata, orient="index").reset_index()
-        mdf.rename(columns={"index": "Script"}, inplace=True)
-        mdf["Percent Removed"] = mdf["Deleted"] / (mdf["Kept"] + mdf["Deleted"])
-        mdf.to_csv(metadata_path, index=False)
+        smdf = pd.DataFrame.from_dict(metadata["script"], orient="index").reset_index()
+        smdf.rename(columns={"index": "Script"}, inplace=True)
+        smdf["Percent Removed"] = smdf["Deleted"] / (smdf["Kept"] + smdf["Deleted"])
+        smdf.to_csv(script_metadata_path, index=False)
 
-        self.logger.debug(f'automatically_process_crawl: saved metadata to {metadata_path}')
+        lang_metadata_path = os.path.join(self.download_dir, prefix_list, "lang_metadata.csv")
+        lmdf = pd.DataFrame.from_dict(metadata["lang_region"], orient="index").reset_index()
+        lmdf.rename(columns={"index": "Language"}, inplace=True)
+        lmdf["Percent Removed"] = lmdf["Deleted"] / (lmdf["Kept"] + lmdf["Deleted"])
+        lmdf.to_csv(lang_metadata_path, index=False)
+
+        self.logger.debug(f'automatically_process_crawl: saved metadata to {script_metadata_path}')
 
         # ----------------------------------------------------------------------------------------------------------------------#
 
