@@ -238,10 +238,41 @@ class CC_Corpus(object):
 
     # ------------------------------------------------------------------------------------------------------------#
 
-    def _download_geolid_models():
-        pass # TODO
+    def _download_geolid_models(self, model_location: str = None):
+        if model_location is None:
+            model_location = os.path.join(self.download_dir, "lid_models")
+
+        model_list = ["baseline", "africa_north", "africa_southern", "africa_sub", "america_brazil", "america_central",
+                      "america_north", "america_south", "asia_central", "asia_east", "asia_south",
+                      "asia_southeast", "europe_east", "europe_russia", "europe_west", "middle_east", "oceania"]
+
+        for model in model_list:
+            model_file = os.path.join(model_location, "geolid."+model+".bin")
+            if not os.path.exists(model_file):
+                os.makedirs(model_location, exist_ok=True)
+                download_model(model, data_dir=model_location)
+                self.logger.debug(f'_download_geolid_models: saved {model} model as {model_file}')
 
     # ----------------------------------------------------------------------------------------------#
+
+    def _label_geolid(self, df):
+        self.logger.info(f"_label_geolid: labeling {len(df)} lines")
+
+        self._download_geolid_models()
+        lid = geoLid(model_location = os.path.join(self.download_dir, "lid_models"))
+        labeled_df = pd.DataFrame()
+
+        for region, group in df.groupby("Region"):
+            group = group.copy()
+            group["Lang_Region"] = lid.predict(data = group["Text"], region = region)
+            labeled_df = pd.concat([labeled_df, group], ignore_index=True)
+
+        labeled_df["Lang_Base"] = lid.predict(data = labeled_df["Text"], region = "baseline")
+
+        return labeled_df
+
+    # ----------------------------------------------------------------------------------------------#
+
     def _process_wet_record(self, wet_record) -> Optional[List[Tuple[str, str, str, int, str, List[str]]]]:
         """Read individual wet record, split the content to different paragraph, apply filter to remove unwanted
         character and short/trivial lines """
@@ -259,9 +290,6 @@ class CC_Corpus(object):
         web_content: str = wet_record.reader.read().decode("utf-8")
         processed_line: List[Tuple[str, str, str, int, str, int]] = []
         line_num = 0  # flag to make sure it is the same page
-
-        self._download_geolid_models()
-        lid = geoLid(model_location = self.download_dir)
 
         for line in web_content.splitlines():
             # we need the line larger than 15 character
@@ -292,9 +320,6 @@ class CC_Corpus(object):
 
             scripts = list(script_details.keys())
 
-            lang_base = lid.predict(data = [line], region = "baseline")[0]
-            lang_region = lid.predict(data = [line], region = current_region)[0]
-
             # Check if line has Chinese / Japanese / Korean characters, then set length to 15:
             if any(script in ["Hani", "Hans", "Hant", "Hrkt", "Kana", "Hira", "Jpan", "Hang", "Jamo", "Kore"] for script in scripts):
                 length = 15
@@ -308,7 +333,7 @@ class CC_Corpus(object):
                     string_counter.get("&", 0) < 4, string_counter.get("[", 0) < 3, string_counter.get("]", 0) < 3,
                     string_counter.get("*", 0) < 5]):
                 line_num += 1
-                processed_line.append((url_suffix, current_country, current_region, url, line_num, line, scripts, lang_base, lang_region))
+                processed_line.append((url_suffix, current_country, current_region, url, line_num, line, scripts))
 
         return processed_line
 
@@ -331,7 +356,7 @@ class CC_Corpus(object):
         cc_index = path_split[1]  # CC-MAIN-2022-40
         name, _ = os.path.splitext(path_split[-1])  # e.g. CC-MAIN-2....wet
 
-        df = pd.DataFrame(lines, columns=("Domain", "Country", "Region", "URL", "LineID", "Text", "Scripts", "Lang_Base", "Lang_Region"))
+        df = pd.DataFrame(lines, columns=("Domain", "Country", "Region", "URL", "LineID", "Text", "Scripts"))
         df.reset_index()
         df.to_feather(os.path.join(self.download_dir, cc_index, f'{name}.feather'))
 
@@ -418,9 +443,16 @@ class CC_Corpus(object):
             for df_file in df_files:
                 df_list.append(pd.read_feather(df_file))
                 os.remove(df_file)
+            combined_df = pd.concat(df_list, ignore_index=True)
+            del df_list
+
+            # GeoLID
+            geolid_df = self._label_geolid(combined_df)
+            del combined_df
+            
             # Save to file using the latest name, add prefix combined
             filename = os.path.join(self.download_dir, prefix_list, f"combined-{os.path.basename(max(df_files))}")
-            pd.concat(df_list, ignore_index=True).to_feather(filename)
+            geolid_df.to_feather(filename)
             
             # Dedupe, add prefix deduplicated
             new_filename = os.path.join(self.download_dir, prefix_list, f"deduplicated-{os.path.basename(filename)}")
