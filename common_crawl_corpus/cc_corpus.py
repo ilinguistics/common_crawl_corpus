@@ -2,6 +2,7 @@ import collections
 import glob
 import gzip
 import logging
+import pickle
 import multiprocessing as mp
 import os
 from shutil import rmtree
@@ -23,6 +24,7 @@ from GlotScript import sp
 from geoLid import geoLid, download_model
 
 from . import utilities
+from . import url_filter
 
 # This dictionary maps country codes to (English) country names
 COUNTRY_CODE_NAME = {
@@ -206,7 +208,7 @@ class CC_Corpus(object):
 
     def __init__(self,
                  countries_to_skip=None,
-                 url_filter: Optional[Union[str, os.PathLike, bytes]] = None,
+                 no_eng = False,
                  download_dir: Union[str, os.PathLike, bytes] = "./common_crawl_download"):
 
         # Ignore certain countries if there is already enough data
@@ -214,13 +216,29 @@ class CC_Corpus(object):
             countries_to_skip = []
         self.countries_to_skip = countries_to_skip
 
-        # Url filter list from file
-        self.url_filter = []
-        if url_filter is not None:
-            self.url_filter = utilities.get_url_filters_from_file(url_filter).keys()
+        #Ignore English if there is already enough data
+        self.no_eng = no_eng
 
         # Download directory
         self.download_dir = download_dir
+
+        # Load or initialize extended url_filter
+        if os.path.exists(os.path.join(self.download_dir, "url_dict.p")):
+            with open(os.path.join(self.download_dir, "url_dict.p"), "rb") as handle:
+                self.url_dict = pickle.load(handle)
+
+        else:
+            self.url_dict = {}
+
+        #url_list
+        self.url_list = url_filter.url_list
+
+        #Update url_list if loaded new url_dict
+        if self.url_dict != {}:
+            for domain in self.url_dict:
+                if len(self.url_dict[domain]) > 3:
+                    if domain not in self.url_list:
+                        self.url_list.append(domain)
 
         # This list defines what countries to include in the corpus
         self.country_codes = []
@@ -270,6 +288,12 @@ class CC_Corpus(object):
 
         labeled_df["Lang_Base"] = lid.predict(data = labeled_df["Text"], region = "baseline")
 
+        #Remove English if necessary
+        if self.no_eng == True:
+            starting = len(labeled_df)
+            labeled_df = labeled_df[labeled_df.loc[:,"Lang_Region"] != "eng"]
+            print("No English:", starting, len(labeled_df))
+
         return labeled_df
 
     # ----------------------------------------------------------------------------------------------#
@@ -283,7 +307,7 @@ class CC_Corpus(object):
         # getting domain abc.example.com -> ExtractResult(subdomain='abc', domain='hostname', suffix='com')
         url_domain, url_suffix = utilities.extract_url(url)
 
-        if url_suffix not in COUNTRY_CODE_NAME.keys() or url_domain in self.url_filter:
+        if url_suffix not in COUNTRY_CODE_NAME.keys() or url_domain in self.url_list:
             return
         current_country = COUNTRY_CODE_NAME.get(url_suffix)
         current_region = COUNTRY_CODE_REGION.get(url_suffix)
@@ -380,6 +404,24 @@ class CC_Corpus(object):
 
     # ----------------------------------------------------------------------------------------------------------------------#
 
+    def _reduce_metadata(self, df, col_name = "Script"):
+        """Aggregate meta-data across many chunks into one file"""
+
+        holder = []
+
+        for name, name_df in df.groupby(col_name):
+
+            kept = name_df.loc[:,"Kept"].sum()
+            removed = name_df.loc[:,"Deleted"].sum()
+            percent = kept / (kept + removed)
+            holder.append([name, kept, removed, percent])
+
+        df = pd.DataFrame(holder, columns = [col_name, "Kept", "Removed", "Pct_Kept"])
+        
+        return df
+
+    # ----------------------------------------------------------------------------------------------------------------------#
+
     def _deduplicate_cc(self, bf: Bloom, metadata: Dict[str, Dict[str, Counter]], path_to_input: str, path_to_output: Optional[str] = None):
         """This method conducts deduplication on a feathered DataFrame and saves the result to a new file."""
         warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -422,101 +464,271 @@ class CC_Corpus(object):
         df.to_feather(path_to_output)
 
         # ------------------------------------------------------------------------------------------------------------#
+    def _dedupe_one_language(self, df):
+
+        #Initialize
+        bf = Bloom(len(df), 0.01)
+        holder = []
+
+        #Add each text to filter and check
+        for text in df.loc[:,"Text"].values:
+            
+            if text in bf:
+                holder.append("Drop")
+            else:
+                holder.append("Keep")
+
+            bf.update(text)
+
+        #Add column and filter df
+        df.loc[:,"Status"] = holder
+        df = df[df.loc[:,"Status"] == "Keep"]
+        df = df.drop("Status", axis = 1)
+
+        return df
+
+        # ------------------------------------------------------------------------------------------------------------#
+
+    def automatically_aggregate_crawl(self, prefix):
+        """Takes a chunk of the crawl (ie., CC-MAIN-2022-40) and aggregates the current output of automatically_process_crawl,
+        applying further deduplication and updating the url filter, then saves to language-specific directories."""
+
+        print(prefix)
+        holder = []
+        lang_holder = []
+        script_holder = []
+        to_delete = []
+        max_chunk = 0
+
+        #First, set the directory
+        root = os.path.join(self.download_dir, prefix)
+
+        #Second, iterate over files
+        for file in sorted(os.listdir(root)):
+            if file.endswith(".feather") and ".warc" not in file:
+
+                print(prefix, file)
+
+                #Some files fail to load
+                try:
+                    df = pd.read_feather(os.path.join(root, file))
+                    load_ok = True
+
+                except Exception as e:
+                    print(e)
+                    load_ok = False
+
+                #Only continue if file loaded
+                if load_ok == True:
+
+                    #Get base urls
+                    if "URL_Domain" not in df.columns:
+                        df = self.scan_url_filters(df)
+                    holder.append(df)
+
+                    #Get chunk id
+                    chunk_id = int(file.split(".")[1])
+
+                    #Keep track of how far into the chunk we have progressed
+                    if chunk_id > max_chunk:
+                        max_chunk = chunk_id
+
+                    #Load language and script meta-data
+                    lang_file = os.path.join(root, "lang_metadata."+prefix+"."+str(chunk_id)+".csv")
+                    script_file = os.path.join(root, "script_metadata."+prefix+"."+str(chunk_id)+".csv")
+
+                    lang_df = pd.read_csv(lang_file)
+                    lang_holder.append(lang_df)
+
+                    script_df = pd.read_csv(script_file)
+                    script_holder.append(script_df)
+
+                    #List of files to delete after processing
+                    to_delete += [os.path.join(root, file), lang_file, script_file]
+
+        #Check for enough objects
+        if len(holder) > 1:
+
+            #Make into one df
+            df = pd.concat(holder)
+            del holder
+
+            #Merge and reduce metadata
+            lang_df = pd.concat(lang_holder)
+            lang_df = self._reduce_metadata(lang_df, col_name = "Language")
+            script_df = pd.concat(script_holder)
+            script_df = self._reduce_metadata(script_df, col_name = "Script")
+
+            #Save aggregated meta-data
+            lang_df.to_csv(os.path.join(root, "language_aggregated."+str(max_chunk)+".csv"))
+            script_df.to_csv(os.path.join(root, "script_aggregated."+str(max_chunk)+".csv"))
+
+            print("Combined size", len(df))
+
+            #Update url_list
+            for domain in self.url_dict:
+                if len(self.url_dict[domain]) > 3:
+                    if domain not in self.url_list:
+                        self.url_list.append(domain)
+
+            #Apply url filter to data
+            df = df[~df.loc[:,"URL_Domain"].isin(self.url_list)]
+            print("After URL filter", len(df))
+
+            #Save url_dict
+            with open(os.path.join(self.download_dir, "url_dict.p"), "wb") as handle:
+                pickle.dump(self.url_dict, handle)
+
+            #Save max chunk reached for further proccessing
+            with open(os.path.join(root, "state.txt"), "w") as f:
+                f.write(str(max_chunk))
+
+            #Sort into languages
+            for language, language_df in df.groupby("Lang_Region"):
+                starting = len(language_df)
+
+                #Deduplicate    
+                language_df = self._dedupe_one_language(language_df)
+                ending = len(language_df)
+
+                #Save to language folder
+                os.makedirs(os.path.join(self.download_dir, "!By_Language", language), exist_ok = True)
+                language_df.to_feather(os.path.join(self.download_dir, "!By_Language", language, prefix+"."+language+"."+str(max_chunk)+".feather"))
+                print(language, starting-ending, end = "\t")
+
+            #Now remove temp chunk files
+            print("")
+            del df
+            print("Deleting files")
+            for file in to_delete:
+                os.remove(file)
+
+        # ------------------------------------------------------------------------------------------------------------#
 
     def automatically_process_crawl(self, prefix_list, chunk_size=2, max_chunks=-1, dedup_size=1):
         """Automatically download, process, and deduplicate on 1 prefix
         e.g. CC-MAIN-2022-40
         """
+        print("Starting", prefix_list)
         self.logger.debug(f'automatically_process_crawl: begin processing on {prefix_list}')
         prefix_filedir = self.download_cc(prefix_list)
         with gzip.open(prefix_filedir) as index_file:
             lines = [line.decode("utf-8").rstrip() for line in index_file.readlines()]
         chunks = utilities.divide_list(lines, chunk_size)
         bf_map = {}
-        metadata = {}
+
+        #Check if resuming after previous run of automatically_aggregate_crawl
+        if os.path.exists(os.path.join(self.download_dir, prefix_list, "state.txt")):
+            with open(os.path.join(self.download_dir, prefix_list, "state.txt")) as f:
+                current_place = int(f.readlines()[0].strip())
+                print("Current chunk starting point:", current_place)
 
         # process each chunk
         for i, chunk in enumerate(chunks, start=1):
-            self.logger.info(f'Processing chunk {i} of {len(chunks)}')
-            self.logger.debug(chunk)
-            for segment in chunk:
-                self.download_and_process_wet_segment(segment)
 
-            # Combine all dataframe within a shard
-            df_files = glob.glob(os.path.join(self.download_dir, prefix_list, 'CC-MAIN-*.feather'))
-            df_list = []
-            for df_file in df_files:
-                df_list.append(pd.read_feather(df_file))
-                os.remove(df_file)
-            combined_df = pd.concat(df_list, ignore_index=True)
-            del df_list
+            #First, check if this is finished
+            lang_metadata_path = os.path.join(self.download_dir, prefix_list, "lang_metadata."+prefix_list+"."+str(i)+".csv")
 
-            # GeoLID
-            geolid_df = self._label_geolid(combined_df)
-            del combined_df
-            
-            holder_dir = os.path.join(self.download_dir, "temp_lang_dir")
-            if not os.path.exists(holder_dir):
-                os.makedirs(holder_dir)
+            if not os.path.exists(lang_metadata_path) and i > current_place:
+                
+                metadata = {}
 
-            # Split by lang
-            for lang in geolid_df["Lang_Region"].unique():
-                lang_df = geolid_df[geolid_df["Lang_Region"] == lang]
-                lang_df.to_feather(os.path.join(holder_dir, f"in.{lang}.feather"))
+                self.logger.info(f'Processing chunk {i} of {len(chunks)}')
+                self.logger.debug(chunk)
+                for segment in chunk:
 
-            del geolid_df
+                    try:
+                        self.download_and_process_wet_segment(segment)
 
-            # Deduplicate each language
-            lang_files = [f for f in os.listdir(holder_dir) if f.startswith("in.")]
-            for lang_file in lang_files:
-                lang_file_path = os.path.join(holder_dir, lang_file)
-                new_filename = os.path.join(holder_dir, f"deduplicated-{lang_file}.feather")
-                lang = lang_file.split(".")[1]
-                if lang not in bf_map:
-                    bf_map[lang] = Bloom(100000 * dedup_size, 0.0001)
-                bf = bf_map[lang]
-                self._deduplicate_cc(bf, metadata, lang_file_path, new_filename)
-                os.remove(lang_file_path)
+                    except Exception as e:
+                        print(e)
 
-            # Combine all deduplicated files
-            full_df = pd.DataFrame()
-            dedup_files = glob.glob(os.path.join(holder_dir, "deduplicated-*.feather"))
-            df_list = []
-            for dedup_file in dedup_files:
-                dedup_file_path = os.path.join(holder_dir, dedup_file)
-                df = pd.read_feather(dedup_file_path)
-                df_list.append(df)
-            full_df = pd.concat(df_list, ignore_index=True)
-            del df_list
+                # Combine all dataframe within a shard
+                df_files = glob.glob(os.path.join(self.download_dir, prefix_list, 'CC-MAIN-*.feather'))
+                df_list = []
+                for df_file in df_files:
+                    df_list.append(pd.read_feather(df_file))
+                    os.remove(df_file)
 
-            # Remove everything in holder_dir
-            rmtree(holder_dir)
+                combined_df = pd.concat(df_list, ignore_index=True)
+                del df_list
 
-            # Save the full deduplicated file
-            new_filename =  os.path.join(self.download_dir, prefix_list, f"deduplicated-combined-{os.path.basename(max(df_files))}")
-            full_df.to_feather(new_filename)
-            self.logger.debug(f'automatically_process_crawl: saved deduplicated file as {new_filename}')
+                # GeoLID
+                combined_df = combined_df[combined_df.loc[:,"Region"] != "antarctica"]  #No Antarctica!
 
-            # Once the number of chunks reaches the dedup_size, clear the bloom filter to reset deduplication
-            if i % dedup_size == 0:
-                bf_map.clear()
-            if i == max_chunks:
-                break
+                #Get base urls
+                combined_df = self.scan_url_filters(combined_df)
 
-        script_metadata_path = os.path.join(self.download_dir, prefix_list, "script_metadata.csv")
-        
-        smdf = pd.DataFrame.from_dict(metadata["script"], orient="index").reset_index()
-        smdf.rename(columns={"index": "Script"}, inplace=True)
-        smdf["Percent Removed"] = smdf["Deleted"] / (smdf["Kept"] + smdf["Deleted"])
-        smdf.to_csv(script_metadata_path, index=False)
+                #Apply url filter to data
+                temp_begin = len(combined_df)
+                combined_df = combined_df[~combined_df.loc[:,"URL_Domain"].isin(self.url_list)]
 
-        lang_metadata_path = os.path.join(self.download_dir, prefix_list, "lang_metadata.csv")
-        lmdf = pd.DataFrame.from_dict(metadata["lang_region"], orient="index").reset_index()
-        lmdf.rename(columns={"index": "Language"}, inplace=True)
-        lmdf["Percent Removed"] = lmdf["Deleted"] / (lmdf["Kept"] + lmdf["Deleted"])
-        lmdf.to_csv(lang_metadata_path, index=False)
+                if len(combined_df) > 10:
+                    geolid_df = self._label_geolid(combined_df)
+                    del combined_df
+                    
+                    holder_dir = os.path.join(self.download_dir, prefix_list+"_temp_lang_dir"+str(i))
+                    if not os.path.exists(holder_dir):
+                        os.makedirs(holder_dir)
 
-        self.logger.debug(f'automatically_process_crawl: saved metadata to {script_metadata_path}')
+                    # Split by lang
+                    for lang in geolid_df["Lang_Region"].unique():
+                        lang_df = geolid_df[geolid_df["Lang_Region"] == lang]
+                        lang_df.to_feather(os.path.join(holder_dir, f"in.{lang}.feather"))
+
+                    del geolid_df
+
+                    # Deduplicate each language
+                    lang_files = [f for f in os.listdir(holder_dir) if f.startswith("in.")]
+                    for lang_file in lang_files:
+                        lang_file_path = os.path.join(holder_dir, lang_file)
+                        new_filename = os.path.join(holder_dir, f"deduplicated-{lang_file}.feather")
+                        lang = lang_file.split(".")[1]
+                        if lang not in bf_map:
+                            bf_map[lang] = Bloom(10000000 * dedup_size, 0.01)
+                        bf = bf_map[lang]
+                        self._deduplicate_cc(bf, metadata, lang_file_path, new_filename)
+                        os.remove(lang_file_path)
+
+                    # Combine all deduplicated files
+                    full_df = pd.DataFrame()
+                    dedup_files = glob.glob(os.path.join(holder_dir, "deduplicated-*.feather"))
+                    df_list = []
+                    for dedup_file in dedup_files:
+                        df = pd.read_feather(dedup_file)
+                        df_list.append(df)
+                    full_df = pd.concat(df_list, ignore_index=True)
+                    del df_list
+
+                    # Remove everything in holder_dir
+                    rmtree(holder_dir)
+
+                    # Save the full deduplicated file
+                    new_filename =  os.path.join(self.download_dir, prefix_list, "deduplicated-combined-"+prefix_list+"."+str(i)+".feather")
+                    full_df.to_feather(new_filename)
+                    self.logger.debug(f'automatically_process_crawl: saved deduplicated file as {new_filename}')
+
+                    # Once the number of chunks reaches the dedup_size, clear the bloom filter to reset deduplication
+                    if i % dedup_size == 0:
+                        bf_map.clear()
+                    if i == max_chunks:
+                        break
+
+                    #Save the meta-data for each chunk, to aid easy restarting
+                    script_metadata_path = os.path.join(self.download_dir, prefix_list, "script_metadata."+prefix_list+"."+str(i)+".csv")
+                    
+                    smdf = pd.DataFrame.from_dict(metadata["script"], orient="index").reset_index()
+                    smdf.rename(columns={"index": "Script"}, inplace=True)
+                    smdf["Percent Removed"] = smdf["Deleted"] / (smdf["Kept"] + smdf["Deleted"])
+                    smdf.to_csv(script_metadata_path, index=False)
+
+                    lang_metadata_path = os.path.join(self.download_dir, prefix_list, "lang_metadata."+prefix_list+"."+str(i)+".csv")
+                    lmdf = pd.DataFrame.from_dict(metadata["lang_region"], orient="index").reset_index()
+                    lmdf.rename(columns={"index": "Language"}, inplace=True)
+                    lmdf["Percent Removed"] = lmdf["Deleted"] / (lmdf["Kept"] + lmdf["Deleted"])
+                    lmdf.to_csv(lang_metadata_path, index=False)
+
+                    self.logger.debug(f'automatically_process_crawl: saved metadata to {script_metadata_path}')
 
         # ----------------------------------------------------------------------------------------------------------------------#
 
@@ -540,13 +752,35 @@ class CC_Corpus(object):
 
         # ----------------------------------------------------------------------------------------------------------------------#
 
-    def scan_url_filters(self, dataframe_dir: Union[str, os.PathLike, bytes]):
-        # todo get url filter from file
-        df = pd.read_feather(dataframe_dir)
-        # todo scan url from each dataframe
-            # todo keep track of the domain and its language, if domain contain more than 3 language, add it onto the file
-        # todo pickle the dictionary so that we can keep track of the number of language each domian have, and how many pages it got
-        pass
+    def scan_url_filters(self, df):
+        
+        # Starting list is from the package
+        url_list = url_filter.url_list
+
+        # Get base domain and country for each sample
+        url_column = []
+        for row in df.itertuples():
+            url = row[4]
+            country = row[2]
+            url_domain, url_suffix = utilities.extract_url(url)
+            
+            #Make sure we are tracking this domain
+            if url_domain not in self.url_dict:
+                self.url_dict[url_domain] = []
+
+            #Add current country if necessary
+            if country not in self.url_dict[url_domain]:
+                self.url_dict[url_domain].append(country)
+
+            #Save to column holder
+            url_column.append(url_domain)
+
+        #Now add column and return new df
+        df.loc[:,"URL_Domain"] = url_column
+            
+        return df
+
+        # ----------------------------------------------------------------------------------------------------------------------#
 
     def final_cc(self, input_dir, output_dir, region):
 
